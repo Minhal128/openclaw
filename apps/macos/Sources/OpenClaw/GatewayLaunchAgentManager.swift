@@ -192,7 +192,8 @@ enum GatewayLaunchAgentManager {
         enabled: Bool,
         port: Int,
         allowUnconfigured: Bool = false,
-        whenMissingCLI: InstalledServiceCLI? = nil) async -> String?
+        whenMissingCLI: InstalledServiceCLI? = nil,
+        checkCurrent: (@MainActor @Sendable () async throws -> Void)? = nil) async -> String?
     {
         if enabled, CommandResolver.connectionModeIsRemote(), !allowUnconfigured {
             self.logger.info("launchd change skipped (remote mode)")
@@ -207,7 +208,7 @@ enum GatewayLaunchAgentManager {
             self.logger.info("launchd enable requested via CLI port=\(port)")
             let existing = self.launchdConfigSnapshot()
             let existed = FileManager.default.fileExists(atPath: self.plistURL.path)
-            let installedCLI: InstalledServiceCLI?
+            var installedCLI: InstalledServiceCLI?
             if BundledRuntime.isBundledApp, existed {
                 let artifacts = self.generatedEnvironmentArtifacts(
                     directory: self.generatedEnvironmentDirectoryURL, profile: .current)
@@ -226,12 +227,21 @@ enum GatewayLaunchAgentManager {
                 }
                 installedCLI = cli
             } else {
+                // Pause removes the plist. An interrupted legacy migration still resumes
+                // through its captured Node install rather than bypassing the core updater.
                 installedCLI = existed ? nil : whenMissingCLI
             }
             let runtime: BundledRuntime?
             do {
                 runtime = BundledRuntime.isBundledApp && !existed && installedCLI == nil
                     ? try await BundledRuntime.seed() : nil
+                if let runtime {
+                    installedCLI = try InstalledServiceCLI(
+                        prefix: runtime.cliCommand,
+                        sqliteLibrary: runtime.sqliteLibrary.path,
+                        environment: self
+                            .retainedServiceEnvironment(stateDirectory: AppProfile.current.stateDirectoryURL()))
+                }
             } catch {
                 return error.localizedDescription
             }
@@ -244,6 +254,7 @@ enum GatewayLaunchAgentManager {
                       self.launchdConfigSnapshot() == existing
                 else { return "Gateway service changed during setup; retry" }
             }
+            do { try await checkCurrent?() } catch { return error.localizedDescription }
             var arguments = self.installArguments(
                 port: port,
                 allowUnconfigured: allowUnconfigured,
@@ -261,11 +272,14 @@ enum GatewayLaunchAgentManager {
                     arguments += ["--runtime-path", executable]
                 }
             }
-            return await self.runDaemonCommand(arguments, runtime: runtime, installedCLI: installedCLI)
+            return await self.runDaemonCommand(
+                arguments, runtime: runtime, installedCLI: installedCLI, checkCurrent: checkCurrent)
         }
 
+        do { try await checkCurrent?() } catch { return error.localizedDescription }
+        guard !self.isLaunchAgentWriteDisabled() else { return "Gateway service changes are disabled" }
         self.logger.info("launchd disable requested via CLI")
-        return await self.runDaemonCommand(["uninstall"])
+        return await self.runDaemonCommand(["uninstall"], checkCurrent: checkCurrent)
     }
 
     static func installArguments(
@@ -304,10 +318,38 @@ enum GatewayLaunchAgentManager {
         return nil
     }
 
+    static func retainedServiceEnvironment(
+        stateDirectory: URL,
+        profile: AppProfile = .current) throws -> [String: String]
+    {
+        let artifacts = self.generatedEnvironmentArtifacts(
+            directory: stateDirectory.appendingPathComponent("service-env"), profile: profile)
+        func exists(_ url: URL) throws -> Bool {
+            do {
+                _ = try FileManager.default.attributesOfItem(atPath: url.path)
+                return true
+            } catch let error as NSError where error.domain == NSCocoaErrorDomain &&
+                (error.code == NSFileReadNoSuchFileError || error.code == NSFileNoSuchFileError)
+            {
+                return false
+            }
+        }
+        guard try exists(artifacts.environment) || exists(artifacts.wrapper) else { return [:] }
+        guard FileManager.default.isReadableFile(atPath: artifacts.environment.path),
+              FileManager.default.isReadableFile(atPath: artifacts.wrapper.path)
+        else {
+            throw GatewayHostingError(message: "The retained Gateway environment is unavailable; repair its service.")
+        }
+        return try LaunchAgentPlist.parseGeneratedEnvironment(
+            String(contentsOf: artifacts.environment, encoding: .utf8))
+    }
+
     static func reinstallBundledRuntime(
         runtime: BundledRuntime,
         port: Int,
-        allowUnconfigured: Bool = false) async -> String?
+        allowUnconfigured: Bool = false,
+        environment: [String: String]? = nil,
+        checkCurrent: (@MainActor @Sendable () async throws -> Void)? = nil) async -> String?
     {
         guard !self.isLaunchAgentWriteDisabled() else { return "Gateway service changes are disabled" }
         let snapshot = self.launchdConfigSnapshot()
@@ -342,6 +384,7 @@ enum GatewayLaunchAgentManager {
                 return error.localizedDescription
             }
         }
+        do { try await checkCurrent?() } catch { return error.localizedDescription }
         guard !Task.isCancelled else { return "Gateway service update was cancelled" }
         guard !self.isLaunchAgentWriteDisabled(),
               FileManager.default.fileExists(atPath: self.plistURL.path) == exists,
@@ -354,7 +397,14 @@ enum GatewayLaunchAgentManager {
                 runtime: runtime,
                 launchAgentExists: exists,
                 replaceRuntime: true),
-            runtime: runtime)
+            runtime: runtime,
+            installedCLI: environment.map {
+                InstalledServiceCLI(
+                    prefix: runtime.cliCommand,
+                    sqliteLibrary: runtime.sqliteLibrary.path,
+                    environment: $0)
+            },
+            checkCurrent: checkCurrent)
     }
 
     static func installedGatewayCommand(
@@ -477,11 +527,17 @@ extension GatewayLaunchAgentManager {
         }
     }
 
-    private static func readDaemonService() async throws -> [String: Any]? {
+    static func serviceIsConfirmedAbsent(installedCLI: InstalledServiceCLI?) async throws -> Bool {
+        guard let service = try await self.readDaemonService(installedCLI: installedCLI) else { return false }
+        return service["loaded"] as? Bool == false && (service["command"] == nil || service["command"] is NSNull)
+    }
+
+    private static func readDaemonService(installedCLI: InstalledServiceCLI? = nil) async throws -> [String: Any]? {
         let result = await self.runDaemonCommandResult(
             ["status", "--json", "--no-probe"],
             timeout: 15,
-            quiet: true)
+            quiet: true,
+            installedCLI: installedCLI)
         guard result.success else {
             throw ServiceInspectionError(message: result.message ?? "Gateway service inspection failed")
         }
@@ -547,7 +603,8 @@ extension GatewayLaunchAgentManager {
         quiet: Bool = false,
         runtime: BundledRuntime? = nil,
         installedCLI: InstalledServiceCLI? = nil,
-        legacyAuthority: InstalledServiceCLI? = nil) async -> String?
+        legacyAuthority: InstalledServiceCLI? = nil,
+        checkCurrent: (@MainActor @Sendable () async throws -> Void)? = nil) async -> String?
     {
         let result = await self.runDaemonCommandResult(
             args,
@@ -555,7 +612,8 @@ extension GatewayLaunchAgentManager {
             quiet: quiet,
             runtime: runtime,
             installedCLI: installedCLI,
-            legacyAuthority: legacyAuthority)
+            legacyAuthority: legacyAuthority,
+            checkCurrent: checkCurrent)
         if result.success { return nil }
         return result.message ?? "Gateway daemon command failed"
     }
@@ -566,7 +624,8 @@ extension GatewayLaunchAgentManager {
         quiet: Bool,
         runtime: BundledRuntime? = nil,
         installedCLI: InstalledServiceCLI? = nil,
-        legacyAuthority: InstalledServiceCLI? = nil) async -> CommandResult
+        legacyAuthority: InstalledServiceCLI? = nil,
+        checkCurrent: (@MainActor @Sendable () async throws -> Void)? = nil) async -> CommandResult
     {
         let beforeSpawn: (@Sendable () -> String?)?
         if args.first == "install" {
@@ -583,6 +642,9 @@ extension GatewayLaunchAgentManager {
         if let resolveCLI = self.testingState.withLock({ $0.resolveCLI }) {
             let command = await self.daemonCommand(
                 args, runtime: runtime, installedCLI: installedCLI, resolveCLI: resolveCLI)
+            do { try await checkCurrent?() } catch {
+                return CommandResult(success: false, payload: nil, message: error.localizedDescription)
+            }
             if let error = beforeSpawn?() { return CommandResult(success: false, payload: nil, message: error) }
             // Snapshot each response and remove it from the queue before a hook can suspend
             // or reenter. Commands run off-actor while tests read their call snapshots.
@@ -618,6 +680,9 @@ extension GatewayLaunchAgentManager {
             environment: ProcessInfo.processInfo.environment,
             profile: .current,
             searchPaths: CommandResolver.preferredPaths())
+        do { try await checkCurrent?() } catch {
+            return CommandResult(success: false, payload: nil, message: error.localizedDescription)
+        }
         let response = await ShellExecutor.runDetailed(
             command: command, cwd: nil, env: env, timeout: timeout, beforeSpawn: beforeSpawn)
         if let error = response.preflightError { return CommandResult(success: false, payload: nil, message: error) }
@@ -667,7 +732,8 @@ extension GatewayLaunchAgentManager {
         searchPaths: [String]) -> [String: String]
     {
         var result = environment.merging(installedCLI?.environment ?? [:]) { _, installed in installed }
-        var paths = searchPaths
+        let installedPaths = installedCLI?.environment["PATH"]?.split(separator: ":").map(String.init) ?? []
+        var paths = installedPaths + searchPaths
         if let runtime {
             paths.insert(runtime.bun.deletingLastPathComponent().path, at: 0)
             result["OPENCLAW_SQLITE_LIBRARY"] = runtime.sqliteLibrary.path
@@ -678,7 +744,8 @@ extension GatewayLaunchAgentManager {
             }
             result["OPENCLAW_SQLITE_LIBRARY"] = installedCLI.sqliteLibrary
         }
-        result["PATH"] = paths.joined(separator: ":")
+        var seen = Set<String>()
+        result["PATH"] = paths.filter { seen.insert($0).inserted }.joined(separator: ":")
         result["OPENCLAW_PROFILE"] = profile.name ?? "default"
         if profile.isActive || runtime != nil || installedCLI != nil {
             let directory = profile.stateDirectoryURL()
