@@ -20,6 +20,7 @@ import { resetAgentEventsForTest } from "../infra/agent-events.js";
 import * as snapshots from "../infra/fs-observation-snapshot.js";
 import type { GatewaySchedulerClock } from "../infra/gateway-scheduler.js";
 import { createDeferredCore } from "../shared/deferred.js";
+import { loadWorkspaceSkills } from "../skills/loading/workspace-skill-loader.js";
 import { registerSkillsChangeListener } from "../skills/runtime/refresh.js";
 import { createGatewaySchedulerClock } from "../test-utils/gateway-scheduler-clock.js";
 import {
@@ -190,10 +191,8 @@ describe("Gateway agent skill refresh", () => {
             return sample;
           });
           const lifecycleEvents: string[] = [];
-          const initialSkillsChange = createDeferredCore();
           unregisterLifecycle = registerSkillsChangeListener((event) => {
             lifecycleEvents.push(event.reason);
-            initialSkillsChange.resolve();
           });
           await new Promise<void>((resolve, reject) => {
             providerServer.once("error", reject);
@@ -228,6 +227,8 @@ describe("Gateway agent skill refresh", () => {
             plugins: { slots: { memory: "none" } },
             tools: { profile: "coding" },
           } satisfies OpenClawConfig;
+          // A prepared catalog can start its watcher without publishing a change.
+          loadWorkspaceSkills(workspace, { config: cfg, agentId: "main" });
           gatewayStartup = startGatewayWithClient({
             cfg,
             configPath,
@@ -270,10 +271,9 @@ describe("Gateway agent skill refresh", () => {
           expect(requests.at(-1)).toContain("seed-skill-description");
           expect(requests.at(-1)).not.toContain("worktree-only-description");
 
-          await racePromiseWithAbortSignal(initialSkillsChange.promise, signal);
           await settleSkillsWatchers(signal);
           await time.advanceBy(30_000);
-          await racePromiseWithAbortSignal(skillsChanged.promise, signal);
+          await gateway.client.request("health", {}, { signal });
           skillsChanged = createDeferredCore();
           const firstLifecycleCount = lifecycleEvents.length;
           const firstEventCount = countSkillsChanged(gatewayEvents);
