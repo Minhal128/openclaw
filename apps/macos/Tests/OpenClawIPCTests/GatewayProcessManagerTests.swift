@@ -761,6 +761,83 @@ struct GatewayProcessManagerTests {
         }
     }
 
+    @Test(arguments: [false, true])
+    func `app hosting refuses settings that cannot survive relaunch before changing the service`(
+        generatedEnvironment: Bool) async throws
+    {
+        guard BundledRuntime.isBundledApp else { return }
+        let port = AppProfile.current.defaultGatewayPort
+        try await self.withLaunchAgentEnvironment(port: port) {
+            let appState = AppStateStore.shared
+            let previousMode = appState.connectionMode
+            appState.connectionMode = .local
+            defer { appState.connectionMode = previousMode }
+            let state = AppProfile.current.stateDirectoryURL()
+            setenv("OPENCLAW_STATE_DIR", state.path, 1)
+            let serviceEnvironment = state.appendingPathComponent("service-env")
+            try #require(!FileManager.default.fileExists(atPath: serviceEnvironment.path))
+            defer { try? FileManager.default.removeItem(at: serviceEnvironment) }
+            let runtime = BundledRuntime(root: state.appendingPathComponent("runtime/installed"))
+            let plist = GatewayLaunchAgentManager.plistURL(
+                homeDirectory: LaunchAgentPlist.homeDirectoryURL, profile: .current)
+            try FileManager.default.createDirectory(
+                at: plist.deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+            var arguments = runtime.cliCommand + ["gateway", "--port", String(port)]
+            if generatedEnvironment {
+                let artifacts = GatewayLaunchAgentManager.generatedEnvironmentArtifacts(
+                    directory: state.appendingPathComponent("service-env"), profile: .current)
+                try FileManager.default.createDirectory(
+                    at: artifacts.wrapper.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try Data("#!/bin/sh\n".utf8).write(to: artifacts.wrapper)
+                try Data("export DURABLE_FIXTURE='durable'\n".utf8).write(to: artifacts.environment)
+                arguments = ["/bin/sh", artifacts.wrapper.path, artifacts.environment.path] + arguments
+            }
+            let definition = try PropertyListSerialization.data(fromPropertyList: [
+                "ProgramArguments": arguments,
+                "EnvironmentVariables": ["INLINE_FIXTURE": "must-survive-relaunch"],
+            ], format: .xml, options: 0)
+            try definition.write(to: plist)
+            let manager = GatewayProcessManager()
+            try #require(manager.keepGatewayRunningAvailable)
+            do {
+                try await manager.setKeepGatewayRunning(false)
+                Issue.record("loss-prone hosting change was accepted")
+            } catch {
+                #expect(error.localizedDescription.contains("Gateway settings exist only in its service definition"))
+                #expect(error.localizedDescription.contains("openclaw gateway install --force"))
+            }
+            #expect(manager.gatewayHosting == .service)
+            #expect(try Data(contentsOf: plist) == definition)
+            #expect(GatewayLaunchAgentManager.testingDaemonCommandCallsSnapshot().isEmpty)
+            #expect(!FileManager.default.fileExists(atPath: state.appendingPathComponent("runtime").path))
+        }
+    }
+
+    @Test func `hosting request retired during prior work dispatches no daemon command`() async throws {
+        let requested = AsyncTestGate()
+        let finishUpdate = AsyncTestGate()
+        defer { finishUpdate.open() }
+        try await self.withLaunchAgentEnvironment {
+            let manager = GatewayProcessManager()
+            manager.bundledUpdateTask = Task { await finishUpdate.wait() }
+            var authorized = true
+            let request = Task {
+                try await manager.setKeepGatewayRunning(true) {
+                    requested.open()
+                    return authorized
+                }
+            }
+            await requested.wait()
+            authorized = false
+            finishUpdate.open()
+            await #expect(throws: CancellationError.self) { try await request.value }
+            #expect(GatewayLaunchAgentManager.testingDaemonCommandCallsSnapshot().isEmpty)
+            #expect(manager.hostingChangeTask == nil)
+            manager.bundledUpdateTask = nil
+        }
+    }
+
     @Test func `hosting changes retain resume intent across failed service removal`() async throws {
         try await self.withLaunchAgentEnvironment(
             statusPayload: #"{"ok":false,"message":"fixture uninstall failed"}"#)
@@ -794,6 +871,16 @@ struct GatewayProcessManagerTests {
         let finishResolution = AsyncTestGate()
         defer { finishResolution.open() }
         try await self.withLaunchAgentEnvironment {
+            let defaults = AppDefaults.standard
+            let previousHosting = defaults.object(forKey: GatewayHosting.defaultsKey)
+            defaults.set(GatewayHosting.service.rawValue, forKey: GatewayHosting.defaultsKey)
+            defer {
+                if let previousHosting {
+                    defaults.set(previousHosting, forKey: GatewayHosting.defaultsKey)
+                } else {
+                    defaults.removeObject(forKey: GatewayHosting.defaultsKey)
+                }
+            }
             GatewayLaunchAgentManager.setTestingInterceptDaemonCommands(true, resolveCLI: { _, _ in
                 resolving.open()
                 await finishResolution.wait()

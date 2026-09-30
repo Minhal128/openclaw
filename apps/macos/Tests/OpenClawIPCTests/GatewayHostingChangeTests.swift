@@ -139,14 +139,13 @@ struct GatewayHostingChangeTests {
 
         """.write(to: artifacts.environment, atomically: false, encoding: .utf8)
         let runtime = BundledRuntime(root: directory.appendingPathComponent("runtime/new-build"))
-        for inline in [["INLINE_FIXTURE": "current-app-value"], [:]] {
+        do {
             let retained = try GatewayLaunchAgentManager.retainedServiceEnvironment(
                 stateDirectory: directory, profile: profile)
             let environment = GatewayProcessManager.appHostedEnvironment(
                 runtime: runtime,
                 profile: profile,
                 processEnvironment: ["FIXTURE_CHANNEL_SETTING": "ambient-value", "PATH": "/fixture/ambient/bin"],
-                inlineEnvironment: inline,
                 retainedEnvironment: retained,
                 searchPaths: ["/usr/bin"])
             let child = GatewayChildSupervisor.Configuration(
@@ -154,7 +153,6 @@ struct GatewayHostingChangeTests {
                 logPath: directory.appendingPathComponent("gateway.log").path, port: 29871, allowUnconfigured: false)
                 .childEnvironment
             #expect(child["FIXTURE_CHANNEL_SETTING"] == "service-value")
-            #expect(child["INLINE_FIXTURE"] == inline["INLINE_FIXTURE"])
             #expect(child["PATH"] == "\(runtime.bun.deletingLastPathComponent().path):/fixture/custom/bin:/usr/bin")
             #expect(child["OPENCLAW_SQLITE_LIBRARY"] == runtime.sqliteLibrary.path)
             #expect(child["OPENCLAW_PROFILE"] == "hosting-environment")

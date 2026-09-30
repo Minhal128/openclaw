@@ -38,7 +38,6 @@ extension GatewayProcessManager {
     private final class HostingChange {
         let previous: GatewayHosting
         let previousCLI: GatewayLaunchAgentManager.InstalledServiceCLI?
-        let previousInlineEnvironment: [String: String]
         let port: Int
         let allowUnconfigured: Bool
         var generation: UInt64
@@ -46,7 +45,6 @@ extension GatewayProcessManager {
         var runtime: BundledRuntime?
         init(manager: GatewayProcessManager, service: ManagedNodeGatewayMigration.ServiceCustody) {
             self.previous = manager.gatewayHosting
-            self.previousInlineEnvironment = manager.appHostedInlineEnvironment
             let state = AppProfile.current.stateDirectoryURL()
             let artifacts = GatewayLaunchAgentManager.generatedEnvironmentArtifacts(
                 directory: state.appendingPathComponent("service-env"), profile: .current)
@@ -101,6 +99,7 @@ extension GatewayProcessManager {
         let service = try await Self.hostingServiceCustody()
         guard isAuthorized() else { throw CancellationError() }
         let change = HostingChange(manager: self, service: service)
+        if hosting == .app { try self.requireDurableAppHostingEnvironment(change.previousCLI) }
         try await Self.changeHosting(operations: .init(
             prepare: {
                 change.runtime = try await BundledRuntime.seed()
@@ -112,9 +111,7 @@ extension GatewayProcessManager {
             replace: { admit in
                 if !self.desiredActive || AppStateStore.shared.isPaused {
                     try admit()
-                    if hosting == .app {
-                        try self.adoptAppHostingEnvironment(change, restoring: false)
-                    } else if let runtime = change.runtime {
+                    if hosting == .service, let runtime = change.runtime {
                         self.retainedServiceCLI = try GatewayLaunchAgentManager.InstalledServiceCLI(
                             prefix: runtime.cliCommand,
                             sqliteLibrary: runtime.sqliteLibrary.path,
@@ -199,7 +196,6 @@ extension GatewayProcessManager {
         try await self.checkHostingChange(change, requiresActive: true)
         guard let runtime = change.runtime else { throw CancellationError() }
         if hosting == .app {
-            try self.adoptAppHostingEnvironment(change, restoring: restoring)
             self.hostingChangeInProgress = false
             self.startIfNeeded()
             change.generation = self.gatewayStartGeneration
@@ -236,18 +232,28 @@ extension GatewayProcessManager {
         guard result.installed else { throw GatewayHostingError(message: "The Gateway service was not installed.") }
     }
 
-    private func adoptAppHostingEnvironment(_ change: HostingChange, restoring: Bool) throws {
-        if restoring {
-            self.appHostedInlineEnvironment = change.previousInlineEnvironment
-            return
-        }
+    private func requireDurableAppHostingEnvironment(_ cli: GatewayLaunchAgentManager.InstalledServiceCLI?) throws {
+        guard let cli, let executable = cli.prefix.first else { return }
+        let profile = AppProfile.current
         let retained = try GatewayLaunchAgentManager.retainedServiceEnvironment(
-            stateDirectory: AppProfile.current.stateDirectoryURL())
-        guard let cli = change.previousCLI else { return }
-        // Generated values remain owned by core's retained file and are reread on every start.
-        // Legacy inline-only settings can survive this app lifetime without a new secret store.
-        self.appHostedInlineEnvironment = cli.environment.filter {
-            !cli.usesGeneratedEnvironment || retained[$0.key] == nil
+            stateDirectory: profile.stateDirectoryURL(), profile: profile)
+        let runtime = BundledRuntime(root: URL(fileURLWithPath: executable)
+            .deletingLastPathComponent().deletingLastPathComponent())
+        func projected(_ environment: [String: String]) -> [String: String] {
+            GatewayChildSupervisor.environmentWithoutSupervisorMarkers(Self.appHostedEnvironment(
+                runtime: runtime,
+                profile: profile,
+                processEnvironment: [:],
+                retainedEnvironment: environment,
+                searchPaths: []))
+        }
+        // Compare what a fresh child would inherit, excluding runtime/profile values and
+        // supervisor markers that its owners replace. Ambient app values are not durable.
+        guard projected(cli.environment) == projected(retained) else {
+            throw GatewayHostingError(message:
+                "Gateway settings exist only in its service definition. Keep background hosting enabled. " +
+                    "Move the settings into the profile's persistent configuration or .env file, " +
+                    "then run openclaw gateway install --force and try again.")
         }
     }
 

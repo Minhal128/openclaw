@@ -146,12 +146,13 @@ the service, or pausing or quitting during the switch, stops automatic recovery;
 the app preserves the newer choice and reports what could not finish.
 
 The app preserves settings from the Gateway's generated service environment and
-rereads that file on later app launches. Older settings stored only inline in a
-LaunchAgent remain available for the current app session; the app does not write
-a separate secret store. Installing the service again follows the Gateway CLI's
-existing environment persistence rules for provider credentials and referenced
-configuration. Arbitrary ambient variables are not guaranteed to persist through
-a new service installation.
+rereads that file on later app launches. If a service has settings that would be
+lost after switching to app hosting, the app leaves the service unchanged and
+asks you to move the needed settings into the profile's persistent configuration
+or `.env` file. Run `openclaw gateway install --force`, then retry the hosting
+change. This uses the Gateway CLI's existing persistence rules for
+provider credentials and referenced configuration; arbitrary ambient variables
+are not guaranteed to persist through a new service installation.
 
 The CLI can also install it directly: `openclaw gateway install`
 (named profiles are selected via the `OPENCLAW_PROFILE` env var).

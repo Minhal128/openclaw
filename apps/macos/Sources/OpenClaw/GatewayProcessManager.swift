@@ -81,7 +81,6 @@ final class GatewayProcessManager {
     var nodeMigrationVersionUpdated = false
     var nodeMigrationCompleted = false
     var nodeMigrationAttempted = false
-    @ObservationIgnored var appHostedInlineEnvironment: [String: String] = [:]
     var retainedServiceCLI: GatewayLaunchAgentManager.InstalledServiceCLI? {
         didSet {
             if let cli = self.retainedServiceCLI {

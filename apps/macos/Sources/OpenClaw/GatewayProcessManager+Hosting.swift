@@ -233,7 +233,6 @@ extension GatewayProcessManager {
             runtime: runtime,
             profile: profile,
             processEnvironment: ProcessInfo.processInfo.environment,
-            inlineEnvironment: self.appHostedInlineEnvironment,
             retainedEnvironment: retained,
             searchPaths: CommandResolver.preferredPaths())
     }
@@ -242,12 +241,10 @@ extension GatewayProcessManager {
         runtime: BundledRuntime,
         profile: AppProfile,
         processEnvironment: [String: String],
-        inlineEnvironment: [String: String],
         retainedEnvironment: [String: String],
         searchPaths: [String]) -> [String: String]
     {
-        var environment = processEnvironment.merging(inlineEnvironment) { _, service in service }
-        environment.merge(retainedEnvironment) { _, retained in retained }
+        var environment = processEnvironment.merging(retainedEnvironment) { _, retained in retained }
         let servicePaths = environment["PATH"]?.split(separator: ":").map(String.init) ?? []
         environment.merge(runtime.environment) { _, runtimeValue in runtimeValue }
         var seen = Set<String>()
